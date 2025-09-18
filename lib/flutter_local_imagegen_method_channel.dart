@@ -1,9 +1,6 @@
 import 'dart:convert';
-import 'dart:typed_data';
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-
 import 'flutter_local_imagegen_platform_interface.dart';
 
 /// An implementation of [FlutterLocalImagegenPlatform] that uses method channels.
