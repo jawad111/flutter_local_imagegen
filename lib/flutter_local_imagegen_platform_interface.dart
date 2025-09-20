@@ -1,5 +1,6 @@
 import 'dart:typed_data';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
+
 import 'flutter_local_imagegen_method_channel.dart';
 
 abstract class FlutterLocalImagegenPlatform extends PlatformInterface {
@@ -8,8 +9,7 @@ abstract class FlutterLocalImagegenPlatform extends PlatformInterface {
 
   static final Object _token = Object();
 
-  static FlutterLocalImagegenPlatform _instance =
-      MethodChannelFlutterLocalImagegen();
+  static FlutterLocalImagegenPlatform _instance = MethodChannelFlutterLocalImagegen();
 
   /// The default instance of [FlutterLocalImagegenPlatform] to use.
   ///

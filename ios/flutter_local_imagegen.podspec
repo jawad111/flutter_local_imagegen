@@ -11,7 +11,7 @@ A new Flutter plugin project using iOS ImagePlayground.
   s.source           = { :path => '.' }
   s.source_files = 'Classes/**/*'
   s.dependency 'Flutter'
-  s.platform = :ios, '18.4'
+  s.platform = :ios, '18.0'
   s.swift_version = '5.10'
   s.module_name = 'flutter_local_imagegen'
   s.frameworks = 'ImagePlayground'
