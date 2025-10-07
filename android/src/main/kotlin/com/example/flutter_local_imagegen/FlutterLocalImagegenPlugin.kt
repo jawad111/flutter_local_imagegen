@@ -95,20 +95,29 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
   // -------- Pipeline --------
 
   private fun generateImageFromText(prompt: String, numInferenceSteps: Int, seed: Long): Bitmap {
-    val clipHiddenStates = encodeText(prompt)
+    val cond = encodeText(prompt)
+    val uncond = encodeText("")
 
     // 256x256 latent (4, 32, 32)
     val latentShape = intArrayOf(1, 4, 32, 32)
     var latents = generateGaussianNoise(latentShape, seed)
 
-    val scheduler = SimpleEulerScheduler(numInferenceSteps)
-    for (t in scheduler.timesteps) {
-      latents = runUnetStep(latents, t, clipHiddenStates)
-      latents = scheduler.step(latents)
+    val guidanceScale = 7.5f
+    val scheduler = EulerScheduler(numInferenceSteps)
+    // Start from correct noise scale
+    latents = scaleLatents(latents, scheduler.sigmas.first())
+    for (i in scheduler.indices) {
+      val tIdx = scheduler.timesteps[i]
+      val sigma = scheduler.sigmas[i]
+      val modelInput = scaleModelInput(latents, sigma)
+      val noisePred = runUnetNoisePrediction(modelInput, tIdx, cond, uncond, guidanceScale)
+      latents = scheduler.step(env, latents, noisePred, i)
+      modelInput.close()
     }
 
     val bmp = decodeLatentsToBitmap(latents)
-    clipHiddenStates.close()
+    cond.close()
+    uncond.close()
     return bmp
   }
 
@@ -159,41 +168,89 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
 
   // -------- U-Net step --------
 
-  private fun runUnetStep(
+  private fun runUnetNoisePrediction(
     latents: OnnxTensor,
     timestep: Int,
-    clipHiddenStates: OnnxTensor
+    cond: OnnxTensor,
+    uncond: OnnxTensor,
+    guidanceScale: Float
   ): OnnxTensor {
     val session = unetSession ?: error("U-Net not initialized")
 
-    // UNet expects timestep as tensor(int32); provide IntBuffer with shape [1]
+    // Prepare batch=2 latents by concatenating along batch dim: [uncond, cond]
+    val latentsArray = tensorTo4DArray(latents)
+    val latentsB2 = arrayOf(latentsArray[0], latentsArray[0])
+    val latentsB2Tensor = float4DTensor(latentsB2)
+
+    // Concatenate hidden states along batch: [uncond, cond]
+    val condArr = tensorTo3DArray(cond)
+    val uncondArr = tensorTo3DArray(uncond)
+    val encB2 = arrayOf(uncondArr[0], condArr[0])
+    val encB2Tensor = float3DTensor(encB2)
+
     val timestepTensor = OnnxTensor.createTensor(
       env, java.nio.IntBuffer.wrap(intArrayOf(timestep)), longArrayOf(1)
     )
 
-    val outputs = session.run(
-      mapOf(
-        "sample" to latents,
-        "timestep" to timestepTensor,
-        "encoder_hidden_states" to clipHiddenStates
-      )
-    )
+    val inputNames = session.inputInfo.keys.toList()
+    // Map common aliases
+    val sampleKey = when {
+      inputNames.contains("sample") -> "sample"
+      inputNames.contains("x") -> "x"
+      else -> inputNames.first()
+    }
+    val timestepKey = when {
+      inputNames.contains("timestep") -> "timestep"
+      inputNames.contains("t") -> "t"
+      else -> inputNames.first { it != sampleKey }
+    }
+    val contextKey = when {
+      inputNames.contains("encoder_hidden_states") -> "encoder_hidden_states"
+      inputNames.contains("context") -> "context"
+      else -> inputNames.first { it != sampleKey && it != timestepKey }
+    }
 
-    val out = outputs[0].value as Array<Array<Array<FloatArray>>> // same shape as latents
+    val feeds = hashMapOf<String, OnnxTensor>()
+    feeds[sampleKey] = latentsB2Tensor
+    feeds[timestepKey] = timestepTensor
+    feeds[contextKey] = encB2Tensor
+
+    val outputs = session.run(feeds)
+
+    val outB2 = outputs[0].value as Array<Array<Array<FloatArray>>> // [2,4,32,32]
     outputs.close()
+
+    // CFG: eps = eps_uncond + s * (eps_cond - eps_uncond)
+    val epsUncond = outB2[0]
+    val epsCond = outB2[1]
+    val cfg = Array(epsUncond.size) { c ->
+      Array(epsUncond[0].size) { y ->
+        FloatArray(epsUncond[0][0].size) { x ->
+          val u = epsUncond[c][y][x]
+          val v = epsCond[c][y][x]
+          (u + guidanceScale * (v - u))
+        }
+      }
+    }
+
     timestepTensor.close()
-    latents.close()
-    return float4DTensor(out)
+    latentsB2Tensor.close()
+    encB2Tensor.close()
+    // Do not close 'latents' here; caller manages its lifecycle
+    return float4DTensor(arrayOf(cfg)) // shape [1,4,32,32]
   }
 
   // -------- VAE decode --------
 
   private fun decodeLatentsToBitmap(latents: OnnxTensor): Bitmap {
     val session = vaeDecoderSession ?: error("VAE decoder not initialized")
-    val outputs = session.run(mapOf("latent_sample" to latents))
+    // SD convention: scale latents by 1 / 0.18215 before VAE decode
+    val scaled = scaleLatents(latents, (1.0f / 0.18215f))
+    val outputs = session.run(mapOf("latent_sample" to scaled))
     val image = outputs[0].value as Array<Array<Array<FloatArray>>> // [1,3,H,W], range [-1,1]
     outputs.close()
     latents.close()
+    scaled.close()
 
     val h = image[0][0].size
     val w = image[0][0][0].size
@@ -208,6 +265,18 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
       }
     }
     return bmp
+  }
+
+  private fun scaleLatents(latents: OnnxTensor, scale: Float): OnnxTensor {
+    val arr = tensorTo4DArray(latents)[0]
+    val scaled = Array(arr.size) { c ->
+      Array(arr[0].size) { y ->
+        FloatArray(arr[0][0].size) { z ->
+          arr[c][y][z] * scale
+        }
+      }
+    }
+    return float4DTensor(arrayOf(scaled))
   }
 
   // -------- ORT / tokenizer init --------
@@ -478,6 +547,30 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
     return OnnxTensor.createTensor(env, fb, longArrayOf(d0.toLong(), d1.toLong(), d2.toLong(), d3.toLong()))
   }
 
+  private fun tensorTo4DArray(t: OnnxTensor): Array<Array<Array<FloatArray>>> {
+    @Suppress("UNCHECKED_CAST")
+    return t.value as Array<Array<Array<FloatArray>>>
+  }
+
+  private fun float3DTensor(arr: Array<Array<FloatArray>>): OnnxTensor {
+    val d0 = arr.size
+    val d1 = arr[0].size
+    val d2 = arr[0][0].size
+    val fb = ByteBuffer.allocateDirect(d0 * d1 * d2 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+    for (i in 0 until d0) {
+      for (j in 0 until d1) {
+        fb.put(arr[i][j])
+      }
+    }
+    fb.rewind()
+    return OnnxTensor.createTensor(env, fb, longArrayOf(d0.toLong(), d1.toLong(), d2.toLong()))
+  }
+
+  private fun tensorTo3DArray(t: OnnxTensor): Array<Array<FloatArray>> {
+    @Suppress("UNCHECKED_CAST")
+    return t.value as Array<Array<FloatArray>>
+  }
+
   private fun generateGaussianNoise(shape: IntArray, seed: Long): OnnxTensor {
     val total = shape.fold(1) { acc, i -> acc * i }
     val rnd = java.util.Random(seed)
@@ -487,11 +580,82 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
     return OnnxTensor.createTensor(env, fb, shape.map { it.toLong() }.toLongArray())
   }
 
-  private class SimpleEulerScheduler(steps: Int) {
-    val timesteps: IntArray = IntArray(steps) { steps - 1 - it }
-    fun step(latents: OnnxTensor): OnnxTensor {
-      return latents
+  private class EulerScheduler(private val steps: Int) {
+    private val trainingTimesteps = 1000
+    val timesteps: IntArray
+    val sigmas: FloatArray
+    val indices: IntArray
+
+    init {
+      val (ts, s) = buildSchedule(steps, trainingTimesteps)
+      timesteps = ts
+      sigmas = s
+      indices = IntArray(steps) { it }
     }
+
+    fun step(env: OrtEnvironment?, latents: OnnxTensor, noisePred: OnnxTensor, i: Int): OnnxTensor {
+      val sigmaT = sigmas[i]
+      val sigmaNext = if (i < sigmas.size - 1) sigmas[i + 1] else 0.0f
+      val dt = sigmaNext - sigmaT
+      val x = (latents.value as Array<Array<Array<FloatArray>>>)[0]
+      val n = (noisePred.value as Array<Array<Array<FloatArray>>>)[0]
+      val updated = Array(x.size) { c ->
+        Array(x[0].size) { y ->
+          FloatArray(x[0][0].size) { z ->
+            // Euler update: x_{t+1} = x_t + dt * d, where d ≈ -eps
+            x[c][y][z] + dt * (-n[c][y][z])
+          }
+        }
+      }
+      latents.close()
+      noisePred.close()
+      val byteCount = updated.size * updated[0].size * updated[0][0].size * 4
+      val fb = ByteBuffer.allocateDirect(byteCount).order(ByteOrder.nativeOrder()).asFloatBuffer()
+      for (c in updated.indices) for (y in updated[c].indices) fb.put(updated[c][y])
+      fb.rewind()
+      return OnnxTensor.createTensor(env, fb,
+        longArrayOf(1, updated.size.toLong(), updated[0].size.toLong(), updated[0][0].size.toLong()))
+    }
+
+    private fun buildSchedule(steps: Int, trainSteps: Int): Pair<IntArray, FloatArray> {
+      // Diffusers v1 scaled_linear beta schedule → alphas_cumprod → sigmas
+      val betaStart = 0.00085
+      val betaEnd = 0.012
+      val betas = DoubleArray(trainSteps) { idx ->
+        val t = idx.toDouble() / (trainSteps - 1).toDouble()
+        val beta = (Math.pow(betaStart, 0.5) + t * (Math.pow(betaEnd, 0.5) - Math.pow(betaStart, 0.5)))
+        beta * beta
+      }
+      val alphas = DoubleArray(trainSteps) { 1.0 - betas[it] }
+      val alphasCumprod = DoubleArray(trainSteps)
+      var prod = 1.0
+      for (i in 0 until trainSteps) { prod *= alphas[i]; alphasCumprod[i] = prod }
+      val sigmasTrain = DoubleArray(trainSteps) { i ->
+        Math.sqrt((1.0 - alphasCumprod[i]) / alphasCumprod[i])
+      }
+
+      // Choose step indices linearly in [0, trainSteps-1], descending
+      val tIdx = IntArray(steps) { k ->
+        val v = (trainSteps - 1) - Math.floor(k * (trainSteps - 1).toDouble() / (steps - 1).toDouble()).toInt()
+        v.coerceIn(0, trainSteps - 1)
+      }
+      val s = FloatArray(steps) { k -> sigmasTrain[tIdx[k]].toFloat() }
+      return Pair(tIdx, s)
+    }
+  }
+
+  private fun scaleModelInput(latents: OnnxTensor, sigma: Float): OnnxTensor {
+    // scale_model_input(x, sigma) = x / sqrt(sigma^2 + 1)
+    val x = tensorTo4DArray(latents)[0]
+    val scale = (1.0f / Math.sqrt((sigma * sigma + 1.0f).toDouble())).toFloat()
+    val scaled = Array(x.size) { c ->
+      Array(x[0].size) { y ->
+        FloatArray(x[0][0].size) { z ->
+          x[c][y][z] * scale
+        }
+      }
+    }
+    return float4DTensor(arrayOf(scaled))
   }
 }
 
