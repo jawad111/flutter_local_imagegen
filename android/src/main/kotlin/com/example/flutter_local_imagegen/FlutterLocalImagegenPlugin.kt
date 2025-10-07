@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
+import android.util.Log
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -33,6 +34,7 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
   private val executor = Executors.newSingleThreadExecutor()
   private val mainHandler = Handler(Looper.getMainLooper())
   private var flutterAssets: FlutterPlugin.FlutterAssets? = null
+  private val TAG = "FlutterLocalImagegen"
 
   // Assets
   private val TEXT_ENCODER_ASSET = "text_encoder/model.ort"
@@ -75,7 +77,8 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
             val b64 = encodeBitmapToBase64(bmp)
             mainHandler.post { result.success(b64) }
           } catch (t: Throwable) {
-            mainHandler.post { result.error("GEN_FAIL", t.message, null) }
+            Log.e(TAG, "Image generation failed", t)
+            mainHandler.post { result.error("GEN_FAIL", t.stackTraceToString(), null) }
           }
         }
       }
@@ -94,8 +97,8 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
   private fun generateImageFromText(prompt: String, numInferenceSteps: Int, seed: Long): Bitmap {
     val clipHiddenStates = encodeText(prompt)
 
-    // 512x512 latent (4, 64, 64)
-    val latentShape = intArrayOf(1, 4, 64, 64)
+    // 256x256 latent (4, 32, 32)
+    val latentShape = intArrayOf(1, 4, 32, 32)
     var latents = generateGaussianNoise(latentShape, seed)
 
     val scheduler = SimpleEulerScheduler(numInferenceSteps)
@@ -117,27 +120,37 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
     val maxLen = 77
     val tokens = tokenizeToIds(prompt, maxLen)
 
-    val inputIds = LongArray(maxLen) { tokens[it] }
-    val attn = LongArray(maxLen) { if (inputIds[it] != 0L) 1L else 0L }
+    val inputIds = IntArray(maxLen) { tokens[it].toInt() }
+    val attn = IntArray(maxLen) { if (inputIds[it] != 0) 1 else 0 }
 
     val inputIdsTensor = OnnxTensor.createTensor(
-      env, java.nio.LongBuffer.wrap(inputIds), longArrayOf(1, maxLen.toLong())
-    )
-    val attnTensor = OnnxTensor.createTensor(
-      env, java.nio.LongBuffer.wrap(attn), longArrayOf(1, maxLen.toLong())
+      env, java.nio.IntBuffer.wrap(inputIds), longArrayOf(1, maxLen.toLong())
     )
 
-    val outputs = session.run(
-      mapOf(
-        "input_ids" to inputIdsTensor,
-        "attention_mask" to attnTensor
+    val inputNames = session.inputInfo.keys.map { it }
+    Log.d(TAG, "Text encoder expects inputs: $inputNames")
+
+    val feeds = HashMap<String, OnnxTensor>(2)
+    when {
+      inputNames.contains("input_ids") -> feeds["input_ids"] = inputIdsTensor
+      inputNames.contains("input") -> feeds["input"] = inputIdsTensor
+      else -> feeds[inputNames.first()] = inputIdsTensor
+    }
+
+    var attnTensor: OnnxTensor? = null
+    if (inputNames.contains("attention_mask")) {
+      attnTensor = OnnxTensor.createTensor(
+        env, java.nio.IntBuffer.wrap(attn), longArrayOf(1, maxLen.toLong())
       )
-    )
+      feeds["attention_mask"] = attnTensor
+    }
+
+    val outputs = session.run(feeds)
 
     val hidden = outputs[0].value as Array<Array<FloatArray>> // [1, 77, hidden]
     outputs.close()
     inputIdsTensor.close()
-    attnTensor.close()
+    attnTensor?.close()
 
     val shape = longArrayOf(1, hidden[0].size.toLong(), hidden[0][0].size.toLong())
     val fb = floatBufferFrom3D(hidden)
@@ -153,8 +166,9 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
   ): OnnxTensor {
     val session = unetSession ?: error("U-Net not initialized")
 
+    // UNet expects timestep as tensor(int32); provide IntBuffer with shape [1]
     val timestepTensor = OnnxTensor.createTensor(
-      env, FloatBuffer.wrap(floatArrayOf(timestep.toFloat())), longArrayOf(1)
+      env, java.nio.IntBuffer.wrap(intArrayOf(timestep)), longArrayOf(1)
     )
 
     val outputs = session.run(
@@ -207,6 +221,13 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
     if (textEncoderSession != null && unetSession != null && vaeDecoderSession != null) return
 
     val so = SessionOptions().apply {
+      try {
+        // Prefer NNAPI on Android devices supporting it, fallback to CPU
+        addNnapi()
+      } catch (_: Throwable) {
+        // NNAPI EP not available, proceed with CPU EP
+      }
+      setOptimizationLevel(SessionOptions.OptLevel.ALL_OPT)
       setIntraOpNumThreads(4)
       setInterOpNumThreads(4)
     }
@@ -215,9 +236,15 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
     val unetFile = ensureAssetToFile(appContext, UNET_ASSET)
     val vaeFile = ensureAssetToFile(appContext, VAE_DECODER_ASSET)
 
-    textEncoderSession = env!!.createSession(textEncFile.absolutePath, so)
-    unetSession = env!!.createSession(unetFile.absolutePath, so)
-    vaeDecoderSession = env!!.createSession(vaeFile.absolutePath, so)
+    try {
+      Log.d(TAG, "Creating ORT sessions with files: text=${textEncFile.absolutePath}, unet=${unetFile.absolutePath}, vae=${vaeFile.absolutePath}")
+      textEncoderSession = env!!.createSession(textEncFile.absolutePath, so)
+      unetSession = env!!.createSession(unetFile.absolutePath, so)
+      vaeDecoderSession = env!!.createSession(vaeFile.absolutePath, so)
+    } catch (t: Throwable) {
+      Log.e(TAG, "Failed to create ORT sessions", t)
+      throw t
+    }
 
     if (vocab == null) loadTokenizer()
   }
@@ -234,7 +261,7 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
   }
 
   private fun loadTokenizer() {
-    val vjson = appContext.assets.open(VOCAB_ASSET).bufferedReader().use { it.readText() }
+    val vjson = openPluginAsset(VOCAB_ASSET).bufferedReader().use { it.readText() }
     val jo = JSONObject(vjson)
     val map = HashMap<String, Long>(jo.length())
     jo.keys().forEach { k ->
@@ -244,7 +271,7 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
     vocab = map
 
     try {
-      val sjson = appContext.assets.open(SPECIAL_TOKENS_ASSET).bufferedReader().use { it.readText() }
+      val sjson = openPluginAsset(SPECIAL_TOKENS_ASSET).bufferedReader().use { it.readText() }
       val so = JSONObject(sjson)
       fun extractToken(key: String): String? {
         if (!so.has(key)) return null
@@ -267,7 +294,7 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
 
     // Load merges.txt into rank map
     val ranks = HashMap<Pair<String, String>, Int>()
-    appContext.assets.open("tokenizer/merges.txt").use { ins ->
+    openPluginAsset("tokenizer/merges.txt").use { ins ->
       BufferedReader(InputStreamReader(ins)).use { br ->
         var line: String?
         var rank = 0
@@ -284,6 +311,18 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
     }
     bpeRanks = ranks
   }
+
+  private fun openPluginAsset(assetPath: String) =
+    // Prefer plugin-scoped asset path first, then app-level assets
+    appContext.assets.open(
+      flutterAssets?.getAssetFilePathByName("packages/flutter_local_imagegen/assets/$assetPath")
+        ?: flutterAssets?.getAssetFilePathByName("assets/$assetPath")
+        ?: run {
+          val fallback = "packages/flutter_local_imagegen/assets/$assetPath"
+          Log.w(TAG, "Fallback asset path for $assetPath -> $fallback")
+          fallback
+        }
+    )
 
   // -------- BPE tokenizer (simplified) --------
 
@@ -376,19 +415,28 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
     if (outFile.exists() && outFile.length() > 0) return outFile
     outFile.parentFile?.mkdirs()
     // Resolve Flutter asset path (works for app assets and plugin package assets)
-    val resolved = flutterAssets?.getAssetFilePathByName(assetPath)
-      ?: flutterAssets?.getAssetFilePathByName("packages/flutter_local_imagegen/$assetPath")
-      ?: assetPath
-    context.assets.open(resolved).use { input ->
-      FileOutputStream(outFile).use { output ->
-        val buf = ByteArray(8 * 1024)
-        while (true) {
-          val read = input.read(buf)
-          if (read <= 0) break
-          output.write(buf, 0, read)
+    val resolved =
+      flutterAssets?.getAssetFilePathByName("packages/flutter_local_imagegen/assets/$assetPath")
+        ?: flutterAssets?.getAssetFilePathByName("assets/$assetPath")
+        ?: flutterAssets?.getAssetFilePathByName(assetPath)
+        ?: "packages/flutter_local_imagegen/assets/$assetPath"
+    Log.d(TAG, "Resolving asset '$assetPath' -> '$resolved' -> '${outFile.absolutePath}'")
+    try {
+      context.assets.open(resolved).use { input ->
+        FileOutputStream(outFile).use { output ->
+          val buf = ByteArray(8 * 1024)
+          while (true) {
+            val read = input.read(buf)
+            if (read <= 0) break
+            output.write(buf, 0, read)
+          }
+          output.flush()
         }
-        output.flush()
       }
+      if (outFile.length() == 0L) error("Copied zero-byte asset: $assetPath from $resolved")
+    } catch (t: Throwable) {
+      Log.e(TAG, "Failed to open/copy asset '$assetPath' resolved as '$resolved'", t)
+      throw t
     }
     return outFile
   }
@@ -446,3 +494,4 @@ class FlutterLocalImagegenPlugin : FlutterPlugin, MethodCallHandler {
     }
   }
 }
+
