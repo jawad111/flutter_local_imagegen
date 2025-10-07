@@ -1,4 +1,4 @@
-package com.jawad.flutter_local_imagegen
+package com.example.flutter_local_imagegen
 
 import android.content.Context
 import android.graphics.Bitmap
